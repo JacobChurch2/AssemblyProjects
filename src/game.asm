@@ -6,9 +6,6 @@ SPRITE_1_ADDR = oam + 4
 SPRITE_2_ADDR = oam + 8
 SPRITE_3_ADDR = oam + 12
 SPRITE_4_ADDR = oam + 16
-SPRITE_5_ADDR = oam + 20
-SPRITE_6_ADDR = oam + 24
-SPRITE_7_ADDR = oam + 28
 
 ;*****************************************************************
 ; Define NES cartridge Header
@@ -68,9 +65,10 @@ ball_y:                 .res 1    ; Ball Y position
 ball_vel_x:             .res 1    ; Ball X Velocity
 ball_vel_y:             .res 1    ; Ball Y Velocity
 score:                  .res 1    ; Score low byte
-scroll:                 .res 1    ; Scroll screen
 time:                   .res 1    ; Time (60hz = 60 FPS)
 seconds:                .res 1    ; Seconds
+lives:                  .res 1    ; lives
+lives_display:          .res 1    ; will store ASCII character for number
 ; Reserve remaining space in this section if needed
                         .res 07   ; Pad to $30 (optional)
 
@@ -198,32 +196,53 @@ remaining_loop:
     CPY #192                               ; Stop after 192 bytes (960 - 768)
     BNE remaining_loop
 
-
-  ; set text location
- 	LDA PPU_STATUS ; reset address latch
- 	LDA #$20 ; set PPU address to $208A (Row = 4, Column = 10)
- 	STA PPU_ADDRESS
- 	LDA #$8A
- 	STA PPU_ADDRESS
-
-  ; print text
- 	; draw some text on the screen
-  LDX #0
-  textloop:
-    LDA hello_txt, X
-    STA PPU_VRAM_IO
-    INX
-    CMP #0
-    BEQ :+
-    JMP textloop
-  :
-
   ; Reset scroll registers to 0,0 (needed after VRAM access)
   LDA #$00
   STA PPU_SCROLL                         ; Write horizontal scroll
   STA PPU_SCROLL                         ; Write vertical scroll
 
   RTS                                    ; Done
+
+.endproc
+
+.proc set_game_over_nametable
+
+    wait_for_vblank
+
+    vram_set_address NAME_TABLE_0_ADDRESS
+
+    LDA #<game_over_nametable
+    STA temp_ptr_low
+    LDA #>game_over_nametable
+    STA temp_ptr_high
+
+    LDY #$00
+    LDX #$03
+
+load_page_over:
+    LDA (temp_ptr_low),Y
+    STA PPU_VRAM_IO
+    INY
+    BNE load_page_over
+
+    INC temp_ptr_high
+    DEX
+    BNE load_page_over
+
+check_remaining_over:
+    LDY #$00
+remaining_loop_over:
+    LDA (temp_ptr_low),Y
+    STA PPU_VRAM_IO
+    INY
+    CPY #192
+    BNE remaining_loop_over
+
+    LDA #$00
+    STA PPU_SCROLL
+    STA PPU_SCROLL
+
+    RTS
 
 .endproc
 
@@ -268,6 +287,10 @@ remaining_loop:
   LDA #1
   STA ball_vel_y
 
+  ;set lives
+  LDA #3
+  STA lives
+
   RTS
 .endproc
 
@@ -306,12 +329,6 @@ remaining_loop:
 
   LDA ball_x
   STA SPRITE_4_ADDR + SPRITE_OFFSET_X
-
-  LDA #$00
-  STA PPU_SCROLL
-  DEC scroll
-  LDA scroll                       ; Write horizontal scroll
-  STA PPU_SCROLL                         ; Write vertical scroll
 
   ; Set OAM address to 0 — required before DMA or manual OAM writes
   LDA #$00
@@ -397,6 +414,140 @@ not_left:
     RTS                       ; Return to caller
 .endproc
 
+.proc check_if_ball_hit
+  ; AABB collision detection between ball and player
+
+    ; Check if ball_x + 7 < player_x → no collision
+    LDA ball_x
+    CLC
+    ADC #7
+    CMP player_x
+    BCC not_hit  ; ball right edge is left of player left edge
+
+    ; Check if ball_x > player_x + 15 → no collision
+    LDA player_x
+    CLC
+    ADC #15
+    CMP ball_x
+    BCC not_hit  ; ball left edge is right of player right edge
+
+    ; Check if ball_y + 7 < player_y → no collision
+    LDA ball_y
+    CLC
+    ADC #7
+    CMP player_y
+    BCC not_hit  ; ball bottom is above player top
+
+    ; Check if ball_y > player_y + 15 → no collision
+    LDA player_y
+    CLC
+    ADC #15
+    CMP ball_y
+    BCC not_hit  ; ball top is below player bottom
+
+  ; If all checks passed, it's a hit
+    hit:
+        ; Subtrack one life
+        LDA lives
+        SEC
+        SBC #1
+        STA lives
+
+        CMP #0
+        BNE again
+
+        JMP game_over
+        RTS
+
+        again:
+        ; Reset ball
+        LDA #128
+        STA ball_x
+        LDA #90
+        STA ball_y
+
+        ; Reset Player
+        LDA #128
+        STA player_x
+        LDA #170
+        STA player_y
+
+        JMP write_lives
+
+        RTS
+
+    not_hit:
+        RTS
+.endproc
+
+.proc game_over
+  ; Set game state
+  LDA #1
+  STA game_state
+
+  ; Disable rendering
+  LDA #0
+  STA PPU_MASK
+
+  ; Draw Game Over screen
+  JSR set_game_over_nametable
+  wait_for_vblank
+
+  ; Reset scroll
+  LDA #0
+  STA PPU_SCROLL
+  STA PPU_SCROLL
+
+  ; Re-enable rendering
+  LDA #(PPUMASK_SHOW_BG | PPUMASK_SHOW_SPRITES)
+  STA PPU_MASK
+
+  wait_press_start:
+    JSR read_controller
+    LDA controller_1
+    AND #PAD_START
+    BEQ wait_press_start
+
+    JMP reset_handler
+.endproc
+
+.proc write_lives
+  ; convert lives to a char
+  LDA lives
+  CLC
+  ADC #'0'         ; convert to ASCII ('0' + lives)
+  STA lives_display
+
+  ; set text location
+  LDA PPU_STATUS ; reset address latch
+  LDA #$20 ; set PPU address to $208A (Row = 4, Column = 10)
+  STA PPU_ADDRESS
+  LDA #$8A
+  STA PPU_ADDRESS
+
+  ; print text
+  ; print "LIVES: "
+  LDX #0
+  textloop:
+    LDA lives_txt, X
+    BEQ draw_lives_digit
+    STA PPU_VRAM_IO
+    INX
+    JMP textloop
+
+  draw_lives_digit:
+    LDA lives_display
+    STA PPU_VRAM_IO
+
+  RTS
+.endproc
+
+.proc reset_scroll
+    LDA #0
+    STA PPU_SCROLL
+    STA PPU_SCROLL
+    RTS
+.endproc
 ;******************************************************************************
 ; Procedure: main
 ;------------------------------------------------------------------------------
@@ -425,19 +576,26 @@ not_left:
     STA PPU_MASK
 
 forever:
-    JSR get_random
-
     ; Wait for vertical blank before doing game logic and rendering updates
     wait_for_vblank
+
+    LDA game_state
+    CMP #1               ; if game_state == 1 (GAME_OVER)
+    BEQ do_game_over     ; skip rest of logic
+
+    JSR get_random
 
     ; Read controller
     JSR read_controller
     JSR update_player
     JSR update_ball
+    JSR check_if_ball_hit
 
+    do_game_over:
     ; Update sprite data (DMA transfer to PPU OAM)
-    JSR update_sprites
-
+    JSR update_sprites   ; still needed to clear/hide sprites
+    JSR reset_scroll
+    JMP forever
     ; Infinite loop — keep running frame logic
     JMP forever
 
@@ -536,13 +694,19 @@ palette_data:
 ; Load nametable data
 nametable_data:
   .incbin "assets/screen.nam"
+game_over_nametable:
+  .incbin "assets/game_over.nam"
 sprite_data:
   .byte 30, 1, 0, 40
   .byte 30, 2, 0, 48
   .byte 38, 3, 0, 40
   .byte 38, 4, 0, 48
-hello_txt:
-.byte 'S','L','E','E','P','Y',' ','G','R','A','P','E', 0
+lives_txt:
+.byte 'L','I','V','E','S',':',' '
+.byte 0
+.byte 0
+game_over_text:
+  .byte 'G','A','M','E',' ','O','V','E','R',0
 
 ; Startup segment
 .segment "STARTUP"
@@ -586,6 +750,10 @@ hello_txt:
   JSR set_palette         ; Set palette colors
   JSR set_nametable       ; Set nametable tiles
   JSR init_sprites        ; Initialize sprites
+  JSR write_lives
+
+  LDA #0
+  STA game_state
 
   JMP main                ; Jump to main program
 .endproc
